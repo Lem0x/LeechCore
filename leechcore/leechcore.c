@@ -11,6 +11,98 @@
 #include "util.h"
 #include "version.h"
 
+
+// ----------------------------------------------------------------------------
+// ASYNC LOGGING MODULE ADDED
+// ----------------------------------------------------------------------------
+#include 
+
+#define LOG_BUFFER_SIZE 16384 // 双缓冲，每个缓冲区可容纳 16384 次读取记录
+
+typedef struct {
+    QWORD pa;
+    DWORD cb;
+} LOG_ENTRY;
+
+typedef struct {
+    LOG_ENTRY entries[LOG_BUFFER_SIZE];
+    LONG count;
+} LOG_BUFFER;
+
+LOG_BUFFER g_LogBuffers[2];
+volatile LONG g_ActiveLogBufferIdx = 0;
+CRITICAL_SECTION g_LogCS;
+HANDLE g_hLogThread = NULL;
+HANDLE g_hLogEvent = NULL;
+volatile BOOL g_bLogThreadActive = FALSE;
+
+// 异步写入文件的后台线程
+DWORD WINAPI AsyncLogThreadProc(LPVOID lpParam) {
+    FILE* fp = NULL;
+    fopen_s(&fp, "leechcore_dma_reads.log", "w"); // 覆盖写入，如需追加改为 "a"
+    if (!fp) return 0;
+    
+    while (g_bLogThreadActive || g_LogBuffers[0].count > 0 || g_LogBuffers[1].count > 0) {
+        WaitForSingleObject(g_hLogEvent, 500); // 500ms 超时强制刷新
+        
+        LOG_BUFFER* pProcessBuffer = NULL;
+        EnterCriticalSection(&g_LogCS);
+        LONG activeIdx = g_ActiveLogBufferIdx;
+        if (g_LogBuffers[activeIdx].count > 0) {
+            pProcessBuffer = &g_LogBuffers[activeIdx];
+            g_ActiveLogBufferIdx = 1 - activeIdx; // 切换活动缓冲区
+            g_LogBuffers[g_ActiveLogBufferIdx].count = 0; // 重置新缓冲区
+        }
+        LeaveCriticalSection(&g_LogCS);
+        
+        if (pProcessBuffer && pProcessBuffer->count > 0) {
+            for (LONG i = 0; i < pProcessBuffer->count; i++) {
+                fprintf(fp, "[READ] PA: 0x%llx, Size: 0x%x\n", pProcessBuffer->entries[i].pa, pProcessBuffer->entries[i].cb);
+            }
+            fflush(fp); // 确保落盘
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+// 供上层调用的非阻塞记录函数
+void LogAsyncRead(QWORD pa, DWORD cb) {
+    EnterCriticalSection(&g_LogCS);
+    LOG_BUFFER* pBuf = &g_LogBuffers[g_ActiveLogBufferIdx];
+    if (pBuf->count < LOG_BUFFER_SIZE) {
+        pBuf->entries[pBuf->count].pa = pa;
+        pBuf->entries[pBuf->count].cb = cb;
+        pBuf->count++;
+        // 缓冲区满了，唤醒后台线程写入
+        if (pBuf->count >= LOG_BUFFER_SIZE) {
+            SetEvent(g_hLogEvent);
+        }
+    }
+    LeaveCriticalSection(&g_LogCS);
+}
+
+void InitAsyncLogger() {
+    InitializeCriticalSection(&g_LogCS);
+    g_LogBuffers[0].count = 0;
+    g_LogBuffers[1].count = 0;
+    g_bLogThreadActive = TRUE;
+    g_hLogEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_hLogThread = CreateThread(NULL, 0, AsyncLogThreadProc, NULL, 0, NULL);
+}
+
+void CleanupAsyncLogger() {
+    g_bLogThreadActive = FALSE;
+    SetEvent(g_hLogEvent); // 唤醒最后一次写入
+    if (g_hLogThread) {
+        WaitForSingleObject(g_hLogThread, 3000);
+        CloseHandle(g_hLogThread);
+    }
+    if (g_hLogEvent) CloseHandle(g_hLogEvent);
+    DeleteCriticalSection(&g_LogCS);
+}
+// ----------------------------------------------------------------------------
+
 //-----------------------------------------------------------------------------
 // Global Context and DLL Attach/Detach:
 //-----------------------------------------------------------------------------
@@ -42,8 +134,10 @@ BOOL WINAPI DllMain(_In_ HINSTANCE hinstDLL, _In_ DWORD fdwReason, _In_ PVOID lp
     if(fdwReason == DLL_PROCESS_ATTACH) {
         ZeroMemory(&g_ctx, sizeof(LC_MAIN_CONTEXT));
         InitializeCriticalSection(&g_ctx.Lock);
+        InitAsyncLogger(); // <--- 添加这一行
     }
     if(fdwReason == DLL_PROCESS_DETACH) {
+        CleanupAsyncLogger(); // <--- 添加这一行
         LcCloseAll();
         DeleteCriticalSection(&g_ctx.Lock);
         ZeroMemory(&g_ctx, sizeof(LC_MAIN_CONTEXT));
@@ -819,6 +913,9 @@ EXPORTED_FUNCTION VOID LcReadScatter(_In_ HANDLE hLC, _In_ DWORD cMEMs, _Inout_ 
         // 1: TRANSLATE
         for(i = 0; i < cMEMs; i++) {
             MEM_SCATTER_STACK_PUSH(ppMEMs[i], ppMEMs[i]->qwA);
+
+            // ---> 在此处注入记录代码 <---
+            LogAsyncRead(ppMEMs[i]->qwA, ppMEMs[i]->cb);
         }
         LcMemMap_TranslateMEMs(ctxLC, cMEMs, ppMEMs);
         // 2: FETCH
